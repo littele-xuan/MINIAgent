@@ -300,6 +300,25 @@ def build_internal_registry_tools(registry) -> list[ToolEntry]:
             tags=['registry', 'governance'],
             metadata={'surface': 'registry'},
         ),
+
+        ToolEntry(
+            name='tool_info',
+            version='2.0.0',
+            description='Alias of tool_get for inspecting one tool in the registry.',
+            input_schema={
+                'type': 'object',
+                'properties': {
+                    'name': {'type': 'string'},
+                    'include_history': {'type': 'boolean'},
+                },
+                'required': ['name'],
+                'additionalProperties': False,
+            },
+            handler=lambda name, include_history=True: tool_get(registry, name, include_history=include_history),
+            category=ToolCategory.INTERNAL_SYSTEM,
+            tags=['registry', 'governance', 'alias'],
+            metadata={'surface': 'registry', 'alias_for': 'tool_get'},
+        ),
         ToolEntry(
             name='tool_get',
             version='2.0.0',
@@ -318,6 +337,22 @@ def build_internal_registry_tools(registry) -> list[ToolEntry]:
             tags=['registry', 'governance'],
             metadata={'surface': 'registry'},
         ),
+
+        ToolEntry(
+            name='registry_stats',
+            version='2.0.0',
+            description='Alias of tool_stats for summarizing registry state.',
+            input_schema={
+                'type': 'object',
+                'properties': {},
+                'required': [],
+                'additionalProperties': False,
+            },
+            handler=lambda: tool_stats(registry),
+            category=ToolCategory.INTERNAL_SYSTEM,
+            tags=['registry', 'governance', 'alias'],
+            metadata={'surface': 'registry', 'alias_for': 'tool_stats'},
+        ),
         ToolEntry(
             name='tool_stats',
             version='2.0.0',
@@ -332,6 +367,22 @@ def build_internal_registry_tools(registry) -> list[ToolEntry]:
             category=ToolCategory.INTERNAL_SYSTEM,
             tags=['registry', 'governance'],
             metadata={'surface': 'registry'},
+        ),
+
+        ToolEntry(
+            name='tool_search',
+            version='2.0.0',
+            description='Alias of tool_list that emphasizes free-text registry search.',
+            input_schema={
+                'type': 'object',
+                'properties': {'query': {'type': 'string'}},
+                'required': [],
+                'additionalProperties': False,
+            },
+            handler=lambda query='': tool_list(registry, query=query),
+            category=ToolCategory.INTERNAL_SYSTEM,
+            tags=['registry', 'governance', 'alias'],
+            metadata={'surface': 'registry', 'alias_for': 'tool_list'},
         ),
         ToolEntry(
             name='tool_add',

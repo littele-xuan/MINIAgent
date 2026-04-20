@@ -18,7 +18,7 @@ class SkillSelector:
         terms = self._terms(query)
         best: tuple[float, SkillBundle] | None = None
         for bundle in bundles:
-            text = ' '.join(filter(None, [bundle.name, bundle.description, bundle.when_to_use or '']))
+            text = ' '.join(filter(None, [bundle.name, bundle.description, bundle.when_to_use or '', ' '.join(bundle.allowed_tools), ' '.join(bundle.frontmatter.examples or [])]))
             lower_text = text.lower()
             score_terms = self._terms(text)
             overlap = terms & score_terms

@@ -103,6 +103,7 @@ class LayeredContextManager(BaseContextManager):
                     'Prefer the live MCP catalog over generic narration.\n'
                     'Batch independent MCP calls in the same turn when they do not depend on each other.\n'
                     'For sequential workflows, issue the next MCP call only after inspecting the previous observation.\n'
+                    'When the user asks to inspect or mutate tools, translate that natural-language request into governance-tool JSON arguments instead of assuming the caller already executed runtime.call_tool(...).\n'
                     'If a registry governance tool mutates the catalog, assume the runtime will refresh the live MCP catalog before the next turn.'
                 ),
             )

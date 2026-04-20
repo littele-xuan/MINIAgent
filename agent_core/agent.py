@@ -63,7 +63,7 @@ class AgentConfig:
     model: str = field(default_factory=lambda: os.getenv('MCP_MODEL')  or '')
     temperature: float = 0.1
     max_steps: int = 6
-    connect_timeout_seconds: float = 20.0
+    connect_timeout_seconds: float = 90
     planner_timeout_seconds: float = 90.0
     tool_timeout_seconds: float = 90.0
     observation_preview_chars: int = 600
@@ -175,6 +175,10 @@ class Agent:
         self.active_skill = None
         self.delegation_skill = None
         if not self.skill_catalog:
+            return None
+
+        explicit_tool_invocation = any(token in query.lower() for token in ['调用工具', '使用工具', 'call tool', 'invoke tool'])
+        if explicit_tool_invocation and skill_name is None:
             return None
 
         selected = None
