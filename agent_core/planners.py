@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import inspect
 import json
 import re
@@ -79,13 +78,441 @@ class BasePlanner(ABC):
         raise NotImplementedError
 
 
-class HeuristicPlanner(BasePlanner):
-    """Deterministic fallback kept for tests and local debugging only.
+_SEQUENTIAL_MARKERS = ('然后', '再', '接着', '之后', 'then', 'next', 'after that', 'and then')
+_FREE_TEXT_PREFIXES = [
+    '请', '帮我', '麻烦', '请你', '请先', '请再', '帮我把', '请把', '请用', '请查看', '请查询', '请列出',
+    'please', 'could you', 'can you', 'list', 'show', 'search', 'find', 'call', 'invoke',
+]
+_BOOLEAN_TRUE = {'true', 'yes', 'on', 'enable', 'enabled', '是', '开启', '启用', '需要'}
+_BOOLEAN_FALSE = {'false', 'no', 'off', 'disable', 'disabled', '否', '关闭', '禁用', '不要'}
 
-    It includes a lightweight governance parser so that tool-registry CRUD can
-    still flow through the same "user query -> planner JSON -> MCP tool call"
-    path instead of bypassing the agent with direct runtime calls.
-    """
+_INTENT_HINTS = [
+    (('列出', '列表', '可用'), 'list show available'),
+    (('查询', '查看', '详情', '信息'), 'inspect info describe'),
+    (('统计',), 'stats summary'),
+    (('版本', '历史'), 'versions history'),
+    (('新增', '添加', '创建'), 'add create'),
+    (('更新', '升级', '修改'), 'update upgrade modify'),
+    (('删除', '移除'), 'remove delete'),
+    (('启用', '恢复'), 'enable'),
+    (('禁用', '停用'), 'disable'),
+    (('调用', '使用'), 'call invoke'),
+    (('搜索', '查找'), 'search find'),
+    (('工具', '注册表', '治理'), 'tool registry governance'),
+    (('反转',), 'reverse'),
+    (('转成', '转换'), 'convert transform'),
+]
+
+
+def _query_signal_text(query: str) -> str:
+    lowered = query.lower()
+    signals = [query]
+    for tokens, english in _INTENT_HINTS:
+        if any(token in lowered for token in tokens):
+            signals.append(english)
+    return ' '.join(signals)
+
+
+_SAFE_OPTIONAL_PROPS = {
+    'query', 'keyword', 'search', 'name', 'text', 'input', 'message', 'value', 'prompt', 'expression',
+    'city', 'location', 'description', 'changelog', 'handler_mode', 'tags', 'aliases',
+    'input_schema_json', 'metadata_json', 'code', 'module_path', 'include_history'
+}
+
+
+def _tokenize(text: str) -> list[str]:
+    return re.findall(r'[a-z0-9_]+|[\u4e00-\u9fff]+', text.lower())
+
+
+def _flatten_metadata(value: Any) -> str:
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return ' '.join(_flatten_metadata(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return ' '.join(_flatten_metadata(item) for item in value)
+    return str(value)
+
+
+def _tool_signal_text(tool: Any) -> str:
+    return ' '.join(
+        filter(
+            None,
+            [
+                getattr(tool, 'name', ''),
+                getattr(tool, 'description', ''),
+                _flatten_metadata(getattr(tool, 'metadata', {})),
+                ' '.join((getattr(tool, 'input_schema', {}) or {}).get('properties', {}).keys()),
+            ],
+        )
+    )
+
+
+def _extract_first_json_object(text: str) -> dict[str, Any] | None:
+    starts = [idx for idx, char in enumerate(text) if char == '{']
+    for start in starts:
+        depth = 0
+        in_string = False
+        escape = False
+        for idx in range(start, len(text)):
+            char = text[idx]
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == '\\':
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+                continue
+            if char == '{':
+                depth += 1
+            elif char == '}':
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start: idx + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break
+                    if isinstance(parsed, dict):
+                        return parsed
+                    break
+    return None
+
+
+def _extract_fenced_block(text: str, *, language: str) -> str | None:
+    match = re.search(rf'```{language}\s*(.*?)```', text, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def _extract_quoted_segments(text: str) -> list[str]:
+    segments: list[str] = []
+    for pattern in [r'`([^`]+)`', r'"([^"]+)"', r'“([^”]+)”']:
+        segments.extend(item.strip() for item in re.findall(pattern, text) if item.strip())
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in segments:
+        if item not in seen:
+            deduped.append(item)
+            seen.add(item)
+    return deduped
+
+
+def _extract_identifier_candidates(text: str) -> list[str]:
+    quoted = [item for item in _extract_quoted_segments(text) if re.fullmatch(r'[A-Za-z0-9_.-]+', item)]
+    contextual = re.findall(
+        r'(?:工具|tool)\s*[：:\s]*["“]?([A-Za-z0-9_.-]+)["”]?' \
+        r'|(?:查看|查询|删除|移除|启用|禁用|更新|升级|调用|使用|inspect|describe|remove|delete|enable|disable|update|call|invoke)\s*["“`]?([A-Za-z0-9_.-]+)["”`]?',
+        text,
+        flags=re.IGNORECASE,
+    )
+    items = quoted[:]
+    for pair in contextual:
+        for value in pair:
+            if value:
+                items.append(value)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if item not in seen:
+            deduped.append(item)
+            seen.add(item)
+    return deduped
+
+
+def _clean_free_text(query: str) -> str:
+    text = query.strip()
+    for prefix in _FREE_TEXT_PREFIXES:
+        if text.lower().startswith(prefix.lower()):
+            text = text[len(prefix):].strip(' ：:，,。')
+            break
+    explicit_json = _extract_first_json_object(text)
+    if explicit_json is not None:
+        try:
+            serialized = json.dumps(explicit_json, ensure_ascii=False)
+            text = text.replace(serialized, '').strip()
+        except Exception:
+            pass
+    return text.strip(' ：:，,。')
+
+
+def _parse_json_text(text: str) -> Any | None:
+    candidate = text.strip()
+    if not candidate:
+        return None
+    if not ((candidate.startswith('{') and candidate.endswith('}')) or (candidate.startswith('[') and candidate.endswith(']'))):
+        return None
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+
+
+def _last_observation_bundle(observations: list[dict[str, Any]]) -> tuple[str, Any | None, list[str]]:
+    if not observations:
+        return '', None, []
+    last = observations[-1]
+    results = last.get('results') or []
+    texts = [item.get('primary_text', '') for item in results if item.get('primary_text')]
+    text = '\n'.join(texts).strip() or str(last.get('observation', '') or '')
+    parsed = _parse_json_text(text)
+    called_tools = [item.get('tool_name', '') for step in observations for item in (step.get('calls') or []) if item.get('tool_name')]
+    return text, parsed, called_tools
+
+
+def _final_from_observations(observations: list[dict[str, Any]], accepted_output_modes: list[str] | None) -> PlannerOutput:
+    text, parsed, _ = _last_observation_bundle(observations)
+    accepted = accepted_output_modes or ['text/plain', 'application/json']
+    if parsed is not None and 'application/json' in accepted:
+        return PlannerOutput(
+            thought='Returning the latest structured observation as the final answer.',
+            mode='final',
+            final=FinalAnswer(output_mode='application/json', data=parsed),
+        )
+    return PlannerOutput(
+        thought='Returning the latest observation as the final answer.',
+        mode='final',
+        final=FinalAnswer(output_mode='text/plain', text=text or '工具执行完成。'),
+    )
+
+
+def _score_tool(query: str, tool: Any) -> float:
+    signal_query = _query_signal_text(query)
+    query_lower = signal_query.lower()
+    tool_name = getattr(tool, 'name', '').lower()
+    tool_tokens = set(_tokenize(_tool_signal_text(tool)))
+    query_tokens = set(_tokenize(signal_query))
+    overlap = len(query_tokens & tool_tokens)
+    score = float(overlap)
+    metadata = getattr(tool, 'metadata', {}) or {}
+    registry_surface = metadata.get('surface') == 'registry'
+
+    management_tokens = {'inspect', 'info', 'describe', 'stats', 'summary', 'versions', 'history', 'list', 'search', 'add', 'create', 'update', 'upgrade', 'modify', 'remove', 'delete', 'enable', 'disable'}
+    invocation_tokens = {'call', 'invoke'}
+    explicit_identifiers = _extract_identifier_candidates(query)
+    if tool_name and tool_name in query_lower:
+        score += 100.0 if (query_tokens & invocation_tokens) else 15.0
+    if tool_name in explicit_identifiers:
+        score += 50.0 if (query_tokens & invocation_tokens) else 8.0
+    if (query_tokens & management_tokens) and not registry_surface:
+        score -= 20.0
+    if registry_surface and ({'tool', 'registry', 'governance'} & query_tokens):
+        score += 40.0
+    if registry_surface and ({'inspect', 'info', 'describe', 'stats', 'summary', 'versions', 'history', 'list', 'search'} & query_tokens):
+        score += 20.0
+    if registry_surface and ({'inspect', 'info', 'describe'} & query_tokens) and ('info' in tool_name or 'get' in tool_name):
+        score += 120.0
+    if registry_surface and ({'versions', 'history'} & query_tokens) and 'version' in tool_name:
+        score += 120.0
+    if registry_surface and ({'stats', 'summary'} & query_tokens) and 'stat' in tool_name:
+        score += 120.0
+    if registry_surface and ({'list', 'search'} & query_tokens) and ('list' in tool_name or 'search' in tool_name):
+        score += 120.0
+    properties = (getattr(tool, 'input_schema', {}) or {}).get('properties', {})
+    score += 0.25 * len(set(properties.keys()) & query_tokens)
+    return score
+
+
+def _infer_boolean(query: str) -> bool | None:
+    tokens = set(_tokenize(query))
+    if tokens & _BOOLEAN_TRUE:
+        return True
+    if tokens & _BOOLEAN_FALSE:
+        return False
+    return None
+
+
+def _infer_property_value(
+    *,
+    property_name: str,
+    property_schema: dict[str, Any],
+    query: str,
+    observations: list[dict[str, Any]],
+    explicit_json: dict[str, Any],
+    quoted: list[str],
+    identifiers: list[str],
+    cleaned_text: str,
+) -> Any | None:
+    if property_name in explicit_json:
+        return explicit_json[property_name]
+    if 'default' in property_schema:
+        return property_schema.get('default')
+
+    latest_text, latest_json, _ = _last_observation_bundle(observations)
+    if isinstance(latest_json, dict) and property_name in latest_json:
+        return latest_json[property_name]
+
+    prop_type = property_schema.get('type')
+    if prop_type == 'boolean':
+        if property_name == 'include_history' and ({'versions', 'history'} & set(_tokenize(_query_signal_text(query)))):
+            return True
+        return _infer_boolean(query)
+
+    if prop_type == 'array':
+        if property_name in explicit_json and isinstance(explicit_json[property_name], list):
+            return explicit_json[property_name]
+        if property_name in {'tags', 'aliases'} and identifiers:
+            return identifiers
+        return None
+
+    if prop_type == 'object':
+        if property_name in explicit_json and isinstance(explicit_json[property_name], dict):
+            return explicit_json[property_name]
+        json_block = _extract_fenced_block(query, language='json')
+        if json_block:
+            try:
+                return json.loads(json_block)
+            except json.JSONDecodeError:
+                return None
+        return None
+
+    if property_name == 'code':
+        code_block = _extract_fenced_block(query, language='python') or _extract_fenced_block(query, language='py')
+        if code_block:
+            return code_block
+
+    if property_name == 'handler_mode':
+        if explicit_json.get('code') is not None or _extract_fenced_block(query, language='python') or _extract_fenced_block(query, language='py'):
+            return 'python_inline'
+        if explicit_json.get('module_path') is not None:
+            return 'python_module'
+
+    if property_name.endswith('_json'):
+        json_block = _extract_fenced_block(query, language='json')
+        if json_block:
+            try:
+                return json.loads(json_block)
+            except json.JSONDecodeError:
+                return None
+
+    if property_name == 'name':
+        return identifiers[0] if identifiers else None
+    if property_name in {'source', 'target', 'alias', 'replaced_by', 'version'}:
+        if property_name == 'source' and len(identifiers) >= 1:
+            return identifiers[0]
+        if property_name == 'target' and len(identifiers) >= 2:
+            return identifiers[1]
+        if property_name in {'alias', 'replaced_by'} and identifiers:
+            return identifiers[-1]
+        if property_name == 'version':
+            match = re.search(r'\b\d+\.\d+\.\d+\b', query)
+            return match.group(0) if match else None
+        return None
+    if property_name in {'query', 'keyword', 'search'}:
+        if quoted:
+            return quoted[-1]
+        return None
+    if property_name in {'text', 'input', 'message', 'value', 'prompt', 'expression', 'city', 'location'}:
+        if latest_text:
+            return latest_text
+        if quoted:
+            return quoted[-1]
+        return cleaned_text or query
+    if property_name in {'description', 'changelog'}:
+        if quoted:
+            return quoted[-1]
+        return cleaned_text or query
+
+    if prop_type == 'string':
+        if latest_text:
+            return latest_text
+        if quoted:
+            return quoted[-1]
+        if identifiers:
+            return identifiers[-1]
+        return cleaned_text or query
+
+    return None
+
+
+def _extract_arguments_for_tool(tool: Any, query: str, observations: list[dict[str, Any]]) -> dict[str, Any] | None:
+    schema = getattr(tool, 'input_schema', {}) or {}
+    properties = schema.get('properties', {}) or {}
+    required = schema.get('required', []) or []
+
+    explicit_json = _extract_first_json_object(query) or {}
+    quoted = _extract_quoted_segments(query)
+    identifiers = _extract_identifier_candidates(query)
+    cleaned_text = _clean_free_text(query)
+
+    arguments: dict[str, Any] = {}
+    for name in properties:
+        if name in explicit_json:
+            arguments[name] = explicit_json[name]
+
+    for name, prop_schema in properties.items():
+        if name in arguments:
+            continue
+        if name not in required and name not in _SAFE_OPTIONAL_PROPS and 'default' not in prop_schema:
+            continue
+        value = _infer_property_value(
+            property_name=name,
+            property_schema=prop_schema,
+            query=query,
+            observations=observations,
+            explicit_json=explicit_json,
+            quoted=quoted,
+            identifiers=identifiers,
+            cleaned_text=cleaned_text,
+        )
+        if value is not None:
+            arguments[name] = value
+
+    if any(name not in arguments for name in required):
+        return None
+    return arguments
+
+
+def _build_schema_guided_plan(
+    *,
+    query: str,
+    visible_tools: list[Any],
+    observations: list[dict[str, Any]],
+    accepted_output_modes: list[str] | None,
+) -> PlannerOutput | None:
+    if not visible_tools:
+        if observations:
+            return _final_from_observations(observations, accepted_output_modes)
+        return None
+
+    sequential = any(marker in query.lower() for marker in _SEQUENTIAL_MARKERS)
+    _, _, called_tools = _last_observation_bundle(observations)
+    ranked = sorted(
+        ((tool, _score_tool(query, tool)) for tool in visible_tools),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    ranked = [(tool, score) for tool, score in ranked if score > 0]
+
+    if observations and not sequential:
+        return _final_from_observations(observations, accepted_output_modes)
+
+    for tool, score in ranked:
+        if observations and tool.name in called_tools:
+            continue
+        arguments = _extract_arguments_for_tool(tool, query, observations)
+        if arguments is None:
+            continue
+        return PlannerOutput(
+            thought=f'Schema-guided routing selected {tool.name} (score={score:.2f}).',
+            mode='mcp',
+            mcp_calls=[MCPToolCall(tool_name=tool.name, arguments=arguments, reason='schema-guided fallback from the live MCP catalog')],
+        )
+
+    if observations:
+        return _final_from_observations(observations, accepted_output_modes)
+    return None
+
+
+class HeuristicPlanner(BasePlanner):
+    """Generic schema-guided fallback planner for local tests and offline runs."""
 
     async def plan(
         self,
@@ -97,484 +524,30 @@ class HeuristicPlanner(BasePlanner):
     ) -> PlannerOutput:
         normalized = query.strip()
         lower = normalized.lower()
-        visible_tools = await agent.list_visible_tools()
-        visible_names = {tool.name for tool in visible_tools}
-
-        follow_up = self._plan_followup_from_observations(
-            query=normalized,
-            lower=lower,
-            observations=observations,
-            visible_names=visible_names,
-        )
-        if follow_up is not None:
-            return follow_up
-
-        governance = self._plan_governance_query(
-            query=normalized,
-            lower=lower,
-            visible_tools=visible_tools,
-            visible_names=visible_names,
-        )
-        if governance is not None:
-            return governance
 
         if any(token in lower for token in ['list skills', 'show skills', '有哪些skill', '哪些skill', 'skills', '技能列表']):
-            skills = ', '.join(skill['name'] for skill in agent.list_skills()) or '(none)'
+            skills = ', '.join(skill['name'] for skill in agent.list_skills()) or '(none loaded)'
             return PlannerOutput(
-                thought='Returning the discovered Anthropic-style skill catalog directly.',
+                thought='Returning the explicitly loaded skill catalog.',
                 mode='final',
-                final=FinalAnswer(output_mode='text/plain', text='可用 skills：' + skills),
+                final=FinalAnswer(output_mode='text/plain', text='已加载 skills：' + skills),
             )
 
-        if ('slugify' in lower or 'slug' in lower or '转成 slug' in lower) and 'slugify_text' in visible_names:
-            text = self._extract_quoted_or_tail_text(normalized)
-            return PlannerOutput(
-                thought='Routing to the live MCP slugify tool.',
-                mode='mcp',
-                mcp_calls=[MCPToolCall(tool_name='slugify_text', arguments={'text': text}, reason='normalize text into a slug')],
-            )
-        if any(token in lower for token in ['reverse', '反转', '倒序']) and 'reverse_text' in visible_names:
-            text = self._extract_quoted_or_tail_text(normalized)
-            return PlannerOutput(
-                thought='Routing to the live MCP reverse tool.',
-                mode='mcp',
-                mcp_calls=[MCPToolCall(tool_name='reverse_text', arguments={'text': text}, reason='reverse the provided text')],
-            )
-
-        expr = self._extract_math_expression(normalized)
-        if expr and 'calculator' in visible_names:
-            return PlannerOutput(
-                thought='Routing to the live MCP calculator tool.',
-                mode='mcp',
-                mcp_calls=[MCPToolCall(tool_name='calculator', arguments={'expression': expr}, reason='evaluate the math expression')],
-            )
-
-        if any(token in lower for token in ['天气', 'weather', 'forecast']) and 'get_weather' in visible_names:
-            city = self._extract_city(normalized)
-            return PlannerOutput(
-                thought='Routing to the live MCP weather tool.',
-                mode='mcp',
-                mcp_calls=[MCPToolCall(tool_name='get_weather', arguments={'city': city}, reason='retrieve the requested weather report')],
-            )
-
-        for tool in visible_tools:
-            keywords = tool.metadata.get('keywords', []) if tool.metadata else []
-            if any(str(keyword).lower() in lower for keyword in keywords):
-                sample_args = {}
-                props = (tool.input_schema or {}).get('properties', {})
-                if 'text' in props:
-                    sample_args['text'] = normalized
-                return PlannerOutput(
-                    thought=f'Routing to the live MCP tool {tool.name}.',
-                    mode='mcp',
-                    mcp_calls=[MCPToolCall(tool_name=tool.name, arguments=sample_args, reason='metadata keyword match')],
-                )
-
-        skill = agent.active_skill
-        if skill is not None:
-            return PlannerOutput(
-                thought='No MCP execution is needed; answering inside the active skill contract.',
-                mode='final',
-                final=FinalAnswer(output_mode='text/plain', text=f'[{skill.name}] {normalized}'),
-            )
+        visible_tools = await agent.list_visible_tools()
+        guided = _build_schema_guided_plan(
+            query=normalized,
+            visible_tools=visible_tools,
+            observations=observations,
+            accepted_output_modes=prompt_context.metadata.get('accepted_output_modes'),
+        )
+        if guided is not None:
+            return guided
 
         return PlannerOutput(
-            thought='No MCP execution is needed; returning a direct answer.',
+            thought='No safe tool plan was inferred; returning a direct answer.',
             mode='final',
             final=FinalAnswer(output_mode='text/plain', text=f'{agent.config.name} 收到：{normalized}'),
         )
-
-    def _plan_followup_from_observations(
-        self,
-        *,
-        query: str,
-        lower: str,
-        observations: list[dict[str, Any]],
-        visible_names: set[str],
-    ) -> PlannerOutput | None:
-        if not observations:
-            return None
-        last = observations[-1]
-        if last.get('mode') != 'mcp':
-            return None
-
-        last_calls = last.get('calls') or []
-        last_results = last.get('results') or []
-        last_tool_name = last_calls[-1].get('tool_name') if last_calls else ''
-        last_text = '\n'.join(item.get('primary_text', '') for item in last_results if item.get('primary_text')).strip()
-
-        wants_slug_then_reverse = (
-            ('slugify' in lower or 'slug' in lower or '转成 slug' in query.lower())
-            and any(token in lower for token in ['reverse', '反转', '倒序'])
-        )
-        if wants_slug_then_reverse and last_tool_name == 'slugify_text' and 'reverse_text' in visible_names:
-            return PlannerOutput(
-                thought='Continuing the sequential text-transform workflow with reverse_text.',
-                mode='mcp',
-                mcp_calls=[
-                    MCPToolCall(
-                        tool_name='reverse_text',
-                        arguments={'text': last_text},
-                        reason='reverse the slugified text from the previous step',
-                    )
-                ],
-            )
-
-        return PlannerOutput(
-            thought='MCP observations are available; returning the consolidated result.',
-            mode='final',
-            final=FinalAnswer(output_mode='text/plain', text=last_text or '工具执行完成。'),
-        )
-
-    def _plan_governance_query(
-        self,
-        *,
-        query: str,
-        lower: str,
-        visible_tools: list[Any],
-        visible_names: set[str],
-    ) -> PlannerOutput | None:
-        explicit_call = self._plan_explicit_tool_invocation(
-            query=query,
-            lower=lower,
-            visible_tools=visible_tools,
-            visible_names=visible_names,
-        )
-        if explicit_call is not None:
-            return explicit_call
-
-        registryish = any(
-            token in lower
-            for token in [
-                'tool', 'tools', 'registry', 'mcp', '工具', '注册表', '治理', 'governance', 'schema', '版本', 'alias', '合并',
-                '启用', '禁用', '删除', '新增', '添加', '更新', '升级',
-            ]
-        )
-        if not registryish:
-            return None
-
-        list_tool_name = self._pick_visible(visible_names, 'tool_search', 'tool_list')
-        info_tool_name = self._pick_visible(visible_names, 'tool_info', 'tool_get')
-        stats_tool_name = self._pick_visible(visible_names, 'registry_stats', 'tool_stats')
-
-        if stats_tool_name and any(token in lower for token in ['统计', 'stats', '概况', 'overview']) and any(token in lower for token in ['registry', '注册表', '工具', 'tool']):
-            return PlannerOutput(
-                thought='Inspecting registry statistics through the governance surface.',
-                mode='mcp',
-                mcp_calls=[MCPToolCall(tool_name=stats_tool_name, arguments={}, reason='summarize registry status')],
-            )
-
-        if 'tool_versions' in visible_names and any(token in lower for token in ['版本历史', 'versions', '历史版本']):
-            name = self._extract_tool_name(query)
-            if name:
-                return PlannerOutput(
-                    thought='Inspecting archived versions for the requested tool.',
-                    mode='mcp',
-                    mcp_calls=[MCPToolCall(tool_name='tool_versions', arguments={'name': name}, reason='retrieve version history for the requested tool')],
-                )
-
-        if 'tool_add' in visible_names and ((any(token in lower for token in ['新增工具', '添加工具', '创建工具', 'add tool', 'create tool'])) or ('新增' in lower and '工具' in lower) or ('添加' in lower and '工具' in lower)):
-            payload = self._extract_governance_payload(query, operation='add')
-            if payload:
-                return PlannerOutput(
-                    thought='Translating the natural-language add request into a tool_add JSON call.',
-                    mode='mcp',
-                    mcp_calls=[MCPToolCall(tool_name='tool_add', arguments=payload, reason='add a new external tool from the user request')],
-                )
-
-        if 'tool_update' in visible_names and ((any(token in lower for token in ['更新工具', '修改工具', '升级工具', 'update tool', 'upgrade tool'])) or ('更新' in lower and '工具' in lower) or ('升级' in lower and '工具' in lower) or ('修改' in lower and '工具' in lower)):
-            payload = self._extract_governance_payload(query, operation='update')
-            if payload:
-                return PlannerOutput(
-                    thought='Translating the natural-language update request into a tool_update JSON call.',
-                    mode='mcp',
-                    mcp_calls=[MCPToolCall(tool_name='tool_update', arguments=payload, reason='update an existing external tool from the user request')],
-                )
-
-        if 'tool_enable' in visible_names and ((any(token in lower for token in ['启用工具', 'enable tool', '重新启用', '恢复工具'])) or ('启用' in lower and '工具' in lower) or ('恢复' in lower and '工具' in lower)):
-            name = self._extract_tool_name(query)
-            if name:
-                return PlannerOutput(
-                    thought='Enabling the requested tool through governance tools.',
-                    mode='mcp',
-                    mcp_calls=[MCPToolCall(tool_name='tool_enable', arguments={'name': name}, reason='re-enable an existing external tool')],
-                )
-
-        if 'tool_disable' in visible_names and ((any(token in lower for token in ['禁用工具', 'disable tool', '停用工具'])) or ('禁用' in lower and '工具' in lower) or ('停用' in lower and '工具' in lower)):
-            name = self._extract_tool_name(query)
-            if name:
-                return PlannerOutput(
-                    thought='Disabling the requested tool through governance tools.',
-                    mode='mcp',
-                    mcp_calls=[MCPToolCall(tool_name='tool_disable', arguments={'name': name}, reason='disable an existing external tool')],
-                )
-
-        if 'tool_remove' in visible_names and ((any(token in lower for token in ['删除工具', '移除工具', 'remove tool', 'delete tool'])) or ('删除' in lower and '工具' in lower) or ('移除' in lower and '工具' in lower)):
-            name = self._extract_tool_name(query)
-            if name:
-                return PlannerOutput(
-                    thought='Removing the requested tool through governance tools.',
-                    mode='mcp',
-                    mcp_calls=[MCPToolCall(tool_name='tool_remove', arguments={'name': name}, reason='remove an external tool from the registry')],
-                )
-
-        if 'tool_deprecate' in visible_names and any(token in lower for token in ['废弃工具', '弃用工具', 'deprecate tool']):
-            name = self._extract_tool_name(query)
-            if name:
-                args = {'name': name}
-                replaced_by = self._extract_replaced_by(query)
-                if replaced_by:
-                    args['replaced_by'] = replaced_by
-                return PlannerOutput(
-                    thought='Deprecating the requested tool through governance tools.',
-                    mode='mcp',
-                    mcp_calls=[MCPToolCall(tool_name='tool_deprecate', arguments=args, reason='deprecate an external tool and optionally point to a replacement')],
-                )
-
-        if 'tool_alias' in visible_names and any(token in lower for token in ['别名', 'alias']):
-            parsed = self._extract_alias_pair(query)
-            if parsed is not None:
-                name, alias = parsed
-                return PlannerOutput(
-                    thought='Adding the requested alias through governance tools.',
-                    mode='mcp',
-                    mcp_calls=[MCPToolCall(tool_name='tool_alias', arguments={'name': name, 'alias': alias}, reason='create an alias for an external tool')],
-                )
-
-        if 'tool_merge' in visible_names and any(token in lower for token in ['合并工具', 'merge tool', 'merge']):
-            parsed = self._extract_merge_pair(query)
-            if parsed is not None:
-                source, target = parsed
-                keep_source = any(token in lower for token in ['保留源工具', 'keep source', '保留原工具'])
-                return PlannerOutput(
-                    thought='Merging the requested tools through governance tools.',
-                    mode='mcp',
-                    mcp_calls=[MCPToolCall(tool_name='tool_merge', arguments={'source': source, 'target': target, 'keep_source': keep_source}, reason='merge one external tool into another')],
-                )
-
-        if info_tool_name and any(token in lower for token in ['详情', '信息', 'schema', '入参', '参数', 'tool info', 'describe']):
-            name = self._extract_tool_name(query)
-            if name:
-                return PlannerOutput(
-                    thought='Inspecting one tool through the governance surface.',
-                    mode='mcp',
-                    mcp_calls=[MCPToolCall(tool_name=info_tool_name, arguments={'name': name}, reason='inspect one tool from the registry')],
-                )
-
-        if list_tool_name and ((any(token in lower for token in ['查找工具', '搜索工具', 'search tool', 'find tool', '列出工具', '工具列表', '可用工具', '治理工具', 'list tools', 'show tools']) or (any(token in lower for token in ['列出', '列表', '可用', 'show', 'list']) and any(token in lower for token in ['工具', 'tool', 'registry', '治理'])))):
-            tool_query = self._extract_search_query(query)
-            args = {'query': tool_query} if tool_query else {}
-            return PlannerOutput(
-                thought='Inspecting the live registry catalog through governance tools.',
-                mode='mcp',
-                mcp_calls=[MCPToolCall(tool_name=list_tool_name, arguments=args, reason='list or search registry tools from the user request')],
-            )
-
-        return None
-
-    def _plan_explicit_tool_invocation(
-        self,
-        *,
-        query: str,
-        lower: str,
-        visible_tools: list[Any],
-        visible_names: set[str],
-    ) -> PlannerOutput | None:
-        if not any(token in lower for token in ['调用工具', 'call tool', '使用工具', 'invoke tool']):
-            return None
-        tool_name = self._extract_explicit_tool_name(query)
-        if not tool_name or tool_name not in visible_names:
-            return None
-        args = self._extract_first_json_object(query) or {}
-        return PlannerOutput(
-            thought=f'Calling the explicitly requested tool {tool_name}.',
-            mode='mcp',
-            mcp_calls=[MCPToolCall(tool_name=tool_name, arguments=args, reason='explicit user-directed tool invocation')],
-        )
-
-    def _pick_visible(self, visible_names: set[str], *candidates: str) -> str | None:
-        for name in candidates:
-            if name in visible_names:
-                return name
-        return None
-
-    def _extract_math_expression(self, text: str) -> str | None:
-        normalized = text.replace('×', '*').replace('÷', '/')
-        matches = re.findall(r'[0-9\s\+\-\*/\(\)\.%]{3,}', normalized)
-        if matches:
-            expr = max(matches, key=len).strip()
-            if re.fullmatch(r'[0-9\s\+\-\*/\(\)\.%]+', expr):
-                return expr
-        return None
-
-    def _extract_city(self, text: str) -> str:
-        match = re.search(r'(?:weather|天气|forecast)\s*(?:for|in)?\s*([A-Za-z\u4e00-\u9fff\- ]{2,})', text, flags=re.IGNORECASE)
-        if match:
-            return match.group(1).strip(' .，。')
-        return text.strip()
-
-    def _extract_quoted_or_tail_text(self, text: str) -> str:
-        quoted = re.findall(r'[`"“](.*?)[`"”]', text)
-        if quoted:
-            return quoted[-1].strip()
-        for marker in ('reverse', 'slugify', '反转', '倒序'):
-            idx = text.lower().find(marker)
-            if idx >= 0:
-                return text[idx + len(marker):].strip(' ：:') or text
-        return text
-
-    def _extract_explicit_tool_name(self, text: str) -> str | None:
-        patterns = [
-            r'(?:调用工具|使用工具|invoke tool|call tool)\s*[：:\s]*[`"“]?([A-Za-z0-9_.-]+)[`"”]?',
-            r'[`"“]([A-Za-z0-9_.-]+)[`"”]\s*(?:工具|tool)',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if match:
-                return match.group(1)
-        return self._extract_tool_name(text)
-
-    def _extract_tool_name(self, text: str) -> str | None:
-        backticked = re.findall(r'`([A-Za-z0-9_.-]+)`', text)
-        if backticked:
-            return backticked[0]
-        contextual_patterns = [
-            r'(?:工具|tool)\s*[：:\s]*["“]?([A-Za-z0-9_.-]+)["”]?',
-            r'(?:禁用|启用|删除|移除|废弃|弃用|更新|升级|查看|查询|inspect|describe|enable|disable|remove|delete|update|upgrade)\s*["“]?([A-Za-z0-9_.-]+)["”]?',
-            r'["“]([A-Za-z0-9_.-]+)["”]?\s*(?:工具|tool)',
-        ]
-        for pattern in contextual_patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if match:
-                return match.group(1)
-        if '{' in text:
-            return None
-        quoted = re.findall(r'["“]([A-Za-z0-9_.-]+)["”]', text)
-        if quoted:
-            return quoted[0]
-        return None
-
-    def _extract_replaced_by(self, text: str) -> str | None:
-        patterns = [
-            r'(?:replaced_by|替代为|替换为|改用)\s*[：:\s]*[`"“]?([A-Za-z0-9_.-]+)[`"”]?',
-            r'(?:use|改用)\s*[`"“]?([A-Za-z0-9_.-]+)[`"”]?\s*(?:instead)?',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if match:
-                return match.group(1)
-        return None
-
-    def _extract_alias_pair(self, text: str) -> tuple[str, str] | None:
-        patterns = [
-            r'给\s*[`"“]?([A-Za-z0-9_.-]+)[`"”]?\s*添加别名\s*[`"“]?([A-Za-z0-9_.-]+)[`"”]?',
-            r'alias\s*[`"“]?([A-Za-z0-9_.-]+)[`"”]?\s*(?:for|to)\s*[`"“]?([A-Za-z0-9_.-]+)[`"”]?',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if match:
-                first, second = match.group(1), match.group(2)
-                if 'alias' in pattern:
-                    return second, first
-                return first, second
-        return None
-
-    def _extract_merge_pair(self, text: str) -> tuple[str, str] | None:
-        patterns = [
-            r'把\s*[`"“]?([A-Za-z0-9_.-]+)[`"”]?\s*合并到\s*[`"“]?([A-Za-z0-9_.-]+)[`"”]?',
-            r'merge\s*[`"“]?([A-Za-z0-9_.-]+)[`"”]?\s*into\s*[`"“]?([A-Za-z0-9_.-]+)[`"”]?',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if match:
-                return match.group(1), match.group(2)
-        return None
-
-    def _extract_search_query(self, text: str) -> str:
-        quoted = re.findall(r'[`"“](.*?)[`"”]', text)
-        if quoted:
-            return quoted[-1].strip()
-        for marker in ('查找工具', '搜索工具', 'search tool', 'find tool'):
-            idx = text.lower().find(marker)
-            if idx >= 0:
-                return text[idx + len(marker):].strip(' ：:，,。')
-        return ''
-
-    def _extract_governance_payload(self, text: str, *, operation: str) -> dict[str, Any] | None:
-        explicit = self._extract_first_json_object(text)
-        if explicit is not None:
-            return explicit
-
-        payload: dict[str, Any] = {}
-        name = self._extract_tool_name(text)
-        if name:
-            payload['name'] = name
-
-        desc_match = re.search(r'(?:描述|description)\s*(?:为|是|:|：)?\s*([^\n。]+)', text, flags=re.IGNORECASE)
-        if desc_match and operation == 'add':
-            payload['description'] = desc_match.group(1).strip()
-
-        version_match = re.search(r'(?:版本|version)\s*(?:为|是|:|：)?\s*([A-Za-z0-9_.-]+)', text, flags=re.IGNORECASE)
-        if version_match:
-            payload['version'] = version_match.group(1).strip()
-
-        code_block = self._extract_fenced_block(text, language='python') or self._extract_fenced_block(text, language='py')
-        if code_block:
-            payload['code'] = code_block
-
-        schema_block = self._extract_fenced_block(text, language='json')
-        if schema_block:
-            try:
-                payload['input_schema_json'] = json.loads(schema_block)
-            except json.JSONDecodeError:
-                pass
-
-        if operation == 'add' and {'name', 'description'} <= set(payload):
-            return payload
-        if operation == 'update' and 'name' in payload:
-            return payload
-        return None
-
-    def _extract_fenced_block(self, text: str, *, language: str) -> str | None:
-        pattern = rf'```{language}\s*(.*?)```'
-        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
-        if match:
-            return match.group(1).strip()
-        return None
-
-    def _extract_first_json_object(self, text: str) -> dict[str, Any] | None:
-        starts = [idx for idx, char in enumerate(text) if char == '{']
-        for start in starts:
-            depth = 0
-            in_string = False
-            escape = False
-            for idx in range(start, len(text)):
-                char = text[idx]
-                if in_string:
-                    if escape:
-                        escape = False
-                    elif char == '\\':
-                        escape = True
-                    elif char == '"':
-                        in_string = False
-                    continue
-                if char == '"':
-                    in_string = True
-                    continue
-                if char == '{':
-                    depth += 1
-                elif char == '}':
-                    depth -= 1
-                    if depth == 0:
-                        candidate = text[start: idx + 1]
-                        try:
-                            parsed = json.loads(candidate)
-                        except json.JSONDecodeError:
-                            break
-                        if isinstance(parsed, dict):
-                            return parsed
-                        break
-        return None
 
 
 class OpenAIPlanner(BasePlanner):
@@ -589,6 +562,7 @@ class OpenAIPlanner(BasePlanner):
         connect_timeout_seconds: float = 20.0,
         request_timeout_seconds: float = 90.0,
         max_retries: int = 0,
+        repair_attempts: int = 2,
         client: Any | None = None,
     ) -> None:
         if client is None:
@@ -608,6 +582,7 @@ class OpenAIPlanner(BasePlanner):
         self._temperature = temperature
         self._max_tokens = max_tokens
         self._request_timeout_seconds = request_timeout_seconds
+        self._repair_attempts = repair_attempts
 
     async def plan(
         self,
@@ -619,30 +594,49 @@ class OpenAIPlanner(BasePlanner):
     ) -> PlannerOutput:
         schema = PlannerOutput.model_json_schema()
         messages = self._build_messages(prompt_context=prompt_context, query=query, observations=observations, schema=schema)
-        raw = await self._complete(messages, schema)
-        try:
-            return PlannerOutput.model_validate(json.loads(raw))
-        except (json.JSONDecodeError, ValidationError) as exc:
-            repair_messages = messages + [
-                {
-                    'role': 'user',
-                    'content': (
-                        'Your previous reply violated the schema or was not valid JSON. '
-                        'Return exactly one corrected JSON object and nothing else.\n'
-                        f'validation_error={exc}\n'
-                        f'previous_reply={raw}'
-                    ),
-                }
-            ]
-            repaired = await self._complete(repair_messages, schema)
+        last_error: Exception | None = None
+        last_raw = '{}'
+
+        for attempt in range(self._repair_attempts + 1):
+            raw = await self._complete(messages, schema)
+            last_raw = raw
             try:
-                return PlannerOutput.model_validate(json.loads(repaired))
-            except (json.JSONDecodeError, ValidationError):
-                return PlannerOutput(
-                    thought=f'planner parse fallback: {exc}',
-                    mode='final',
-                    final=FinalAnswer(output_mode='text/plain', text=raw),
-                )
+                return PlannerOutput.model_validate(json.loads(raw))
+            except (json.JSONDecodeError, ValidationError) as exc:
+                last_error = exc
+                if attempt >= self._repair_attempts:
+                    break
+                messages = messages + [
+                    {
+                        'role': 'user',
+                        'content': (
+                            'Your previous reply violated the schema or was not valid JSON. '
+                            'Return exactly one corrected JSON object and nothing else.\n'
+                            f'validation_error={exc}\n'
+                            f'previous_reply={raw}'
+                        ),
+                    }
+                ]
+
+        visible_tools = await agent.list_visible_tools()
+        guided = _build_schema_guided_plan(
+            query=query,
+            visible_tools=visible_tools,
+            observations=observations,
+            accepted_output_modes=prompt_context.metadata.get('accepted_output_modes'),
+        )
+        if guided is not None:
+            return guided
+
+        if observations:
+            return _final_from_observations(observations, prompt_context.metadata.get('accepted_output_modes'))
+
+        error_text = f'planner returned invalid JSON after retries: {last_error}; raw={last_raw}' if last_error else last_raw
+        return PlannerOutput(
+            thought='Planner repair fallback produced a direct final answer.',
+            mode='final',
+            final=FinalAnswer(output_mode='text/plain', text=error_text),
+        )
 
     def _build_messages(
         self,

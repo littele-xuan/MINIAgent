@@ -49,8 +49,8 @@ async def main() -> None:
     )
 
     await agent.refresh_tools()
-    await agent.load_skills()
-    result = await agent.run_detailed(args.query)
+    await agent.load_skills(['text-transform', 'registry-maintainer', 'a2a-router', 'math-specialist'])
+    result = await agent.run_detailed(args.query, skill_name='text-transform')
 
     print('\n=== Skill Result ===', flush=True)
     print(result.answer, flush=True)

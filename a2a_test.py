@@ -59,7 +59,7 @@ async def build_agent(
         tool_runtime=LocalRegistryToolRuntime(registry),
     )
     await agent.refresh_tools()
-    await agent.load_skills()
+    await agent.load_skills(['text-transform', 'registry-maintainer', 'a2a-router', 'math-specialist'])
     return agent
 
 

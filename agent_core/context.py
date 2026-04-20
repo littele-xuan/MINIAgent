@@ -56,7 +56,7 @@ class LayeredContextManager(BaseContextManager):
                     'This agent is API-first and MCP-native. All executable capabilities must come from the live MCP tool catalog below.\n'
                     'Do not invent tools. Do not rely on hidden local routing, heuristic tool picking, or ad hoc execution paths.\n'
                     'When mode="mcp", every tool_name must exist in the live catalog and every arguments object must satisfy that tool\'s input_schema.\n'
-                    'Use mode="final" only when the answer can be produced directly from the user request, active skill instructions, live catalog metadata, or prior observations.\n'
+                    'Use mode="final" only when the answer can be produced directly from the user request, explicitly selected skill instructions, live catalog metadata, or prior observations.\n'
                     'The output must always be a single strict JSON object matching the planner schema. No markdown. No prose outside JSON.'
                 ),
             )

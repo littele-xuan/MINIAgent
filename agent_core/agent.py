@@ -57,13 +57,15 @@ class AgentConfig:
     verbose: bool = False
     skills_root: str | None = None
     skill_tool_policy: str = 'advisory'  # advisory | restrictive
+    auto_load_skills: bool = False
+    auto_activate_skills: bool = False
     planner: str = 'api'  # api | openai | heuristic
     api_base: str = field(default_factory=lambda: os.getenv('MCP_API_BASE')  or 'https://api.openai.com/v1')
     api_key: str = field(default_factory=lambda: os.getenv('MCP_API_KEY') or '')
     model: str = field(default_factory=lambda: os.getenv('MCP_MODEL')  or '')
     temperature: float = 0.1
     max_steps: int = 6
-    connect_timeout_seconds: float = 90
+    connect_timeout_seconds: float = 20.0
     planner_timeout_seconds: float = 90.0
     tool_timeout_seconds: float = 90.0
     observation_preview_chars: int = 600
@@ -120,7 +122,8 @@ class Agent:
     async def attach_tool_runtime(self, tool_runtime: BaseToolRuntime) -> None:
         self.tool_runtime = tool_runtime
         await self.refresh_tools()
-        await self.load_skills()
+        if self.config.auto_load_skills:
+            await self.load_skills()
 
     async def connect(self, server_script: str, *, env: dict[str, str] | None = None) -> None:
         runtime = MCPClientToolRuntime()
@@ -151,22 +154,39 @@ class Agent:
         self._tools = await asyncio.wait_for(self.tool_runtime.list_tools(), timeout=self.config.tool_timeout_seconds)
         return list(self._tools)
 
-    async def load_skills(self) -> list[SkillBundle]:
+    async def discover_skills(self) -> list[SkillBundle]:
         if self.skill_loader is None:
+            return []
+        return self.skill_loader.discover_bundles()
+
+    async def load_skills(self, skill_names: list[str] | None = None) -> list[SkillBundle]:
+        bundles = await self.discover_skills()
+        if not bundles:
             self.skill_catalog = []
             return []
-        bundles = self.skill_loader.discover_bundles()
-        self.skill_catalog = bundles
-        if self.tool_runtime is not None and self.tool_runtime.supports_dynamic_registration():
-            for bundle in bundles:
+        selected_names = set(skill_names or [])
+        selected = [bundle for bundle in bundles if not selected_names or bundle.name in selected_names]
+
+        existing = {bundle.name for bundle in self.skill_catalog}
+        for bundle in selected:
+            if bundle.name in existing:
+                continue
+            self.skill_catalog.append(bundle)
+            if self.tool_runtime is not None and self.tool_runtime.supports_dynamic_registration():
                 for entry in self.skill_registrar.build_tool_entries(bundle):
                     try:
                         self.tool_runtime.register_tool_entry(entry)  # type: ignore[attr-defined]
                     except Exception:
                         continue
+        if self.tool_runtime is not None and self.tool_runtime.supports_dynamic_registration() and selected:
             await self.refresh_tools()
-        self._log(f'loaded {len(self.skill_catalog)} Anthropic-style skills')
-        return bundles
+        self._log(f'loaded {len(selected)} skills explicitly; total loaded={len(self.skill_catalog)}')
+        return list(self.skill_catalog)
+
+    def clear_loaded_skills(self) -> None:
+        self.skill_catalog = []
+        self.active_skill = None
+        self.delegation_skill = None
 
     def list_skills(self) -> list[dict[str, Any]]:
         return [bundle.catalog_entry() for bundle in self.skill_catalog]
@@ -176,31 +196,23 @@ class Agent:
         self.delegation_skill = None
         if not self.skill_catalog:
             return None
-
-        explicit_tool_invocation = any(token in query.lower() for token in ['调用工具', '使用工具', 'call tool', 'invoke tool'])
-        if explicit_tool_invocation and skill_name is None:
+        if not skill_name:
             return None
 
         selected = None
-        if skill_name:
-            for bundle in self.skill_catalog:
-                if bundle.name == skill_name:
-                    selected = bundle.clone_for_arguments(skill_arguments)
-                    break
-        else:
-            prompt_bundles = [bundle for bundle in self.skill_catalog if not self._is_a2a_skill(bundle)]
-            activation = self.skill_selector.choose(query, prompt_bundles)
-            if activation is not None:
-                selected = activation.clone_for_arguments(skill_arguments)
+        for bundle in self.skill_catalog:
+            if bundle.name == skill_name:
+                selected = bundle.clone_for_arguments(skill_arguments)
+                break
 
         if selected is None:
             return None
         if self._is_a2a_skill(selected):
             self.delegation_skill = selected
-            self._log(f'runtime A2A skill selected: {selected.name}')
+            self._log(f'runtime A2A skill selected explicitly: {selected.name}')
         else:
             self.active_skill = selected
-            self._log(f'active prompt skill: {selected.name}')
+            self._log(f'active prompt skill selected explicitly: {selected.name}')
         return selected
 
     async def list_visible_tools(self) -> list[ToolDescriptor]:

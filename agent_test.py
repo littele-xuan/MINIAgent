@@ -15,7 +15,6 @@ DEFAULT_CASES = [
     '请先把 `Hello World 2026` 转成 slug，再把结果反转。',
 ]
 
-
 ADD_TOOL_QUERY = r'''请新增一个工具。请根据下面 JSON 生成一次 tool_add 调用：
 {
   "name": "echo_governance_demo",
@@ -38,16 +37,10 @@ UPDATE_TOOL_QUERY = r'''请更新工具 `echo_governance_demo`。请根据下面
   "name": "echo_governance_demo",
   "description": "Echo text with an updated governance marker",
   "code": "def handler(text: str):\n    return {\"message\": f\"governed-v2::{text.upper()}\"}",
+  "version": "1.0.1",
   "changelog": "upgrade governance smoke test tool"
 }
 '''
-
-
-CALL_TOOL_QUERY = '请调用工具 `echo_governance_demo`，参数 {"text": "hello"}。'
-DISABLE_TOOL_QUERY = '请禁用工具 `echo_governance_demo`。'
-ENABLE_TOOL_QUERY = '请启用工具 `echo_governance_demo`。'
-REMOVE_TOOL_QUERY = '请删除工具 `echo_governance_demo`。'
-VERSIONS_QUERY = '请查看 `echo_governance_demo` 的版本历史。'
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,18 +51,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--model', default=os.getenv('MCP_MODEL') or os.getenv('OPENAI_MODEL') or '')
     parser.add_argument('--planner', choices=['api', 'heuristic'], default='api')
     parser.add_argument('--max-steps', type=int, default=6)
-    parser.add_argument('--connect-timeout', type=float, default=90)
+    parser.add_argument('--connect-timeout', type=float, default=20.0)
     parser.add_argument('--planner-timeout', type=float, default=90.0)
     parser.add_argument('--tool-timeout', type=float, default=90.0)
     parser.add_argument('--verbose', action='store_true', default=True)
     parser.add_argument('--skip-governance-smoke', action='store_true')
     parser.add_argument('--skip-extra-cases', action='store_true')
+    parser.add_argument('--load-skill', action='append', default=[], help='Explicitly load one skill by name. Repeatable.')
+    parser.add_argument('--use-skill', default=None, help='Explicitly activate one already-loaded skill for the main query.')
     return parser
 
 
-async def run_case(agent: Agent, query: str) -> None:
+async def run_case(agent: Agent, query: str, *, skill_name: str | None = None) -> None:
     print(f'\n=== Query ===\n{query}', flush=True)
-    result = await agent.run_detailed(query)
+    result = await agent.run_detailed(query, skill_name=skill_name)
     print('--- Final Answer ---', flush=True)
     print(result.answer, flush=True)
     print(f'output_mode={result.output_mode} selected_skill={result.selected_skill}', flush=True)
@@ -84,13 +79,13 @@ async def governance_smoke(agent: Agent) -> None:
     for query in [
         '请列出当前可用的治理工具。',
         ADD_TOOL_QUERY,
-        CALL_TOOL_QUERY,
+        '请调用工具 `echo_governance_demo`，参数 {"text": "hello"}。',
         UPDATE_TOOL_QUERY,
-        CALL_TOOL_QUERY,
-        VERSIONS_QUERY,
-        DISABLE_TOOL_QUERY,
-        ENABLE_TOOL_QUERY,
-        REMOVE_TOOL_QUERY,
+        '请调用工具 `echo_governance_demo`，参数 {"text": "hello"}。',
+        '请查看 `echo_governance_demo` 的版本历史。',
+        '请禁用工具 `echo_governance_demo`。',
+        '请启用工具 `echo_governance_demo`。',
+        '请删除工具 `echo_governance_demo`。',
     ]:
         await run_case(agent, query)
 
@@ -107,7 +102,7 @@ async def main() -> None:
     agent = Agent(
         AgentConfig(
             name='demo-agent',
-            description='MCP + Skill integration demo agent',
+            description='MCP + manual-skill integration demo agent',
             skills_root=str(skills_root),
             planner=args.planner,
             api_base=args.api_base,
@@ -118,6 +113,8 @@ async def main() -> None:
             planner_timeout_seconds=args.planner_timeout,
             tool_timeout_seconds=args.tool_timeout,
             verbose=args.verbose,
+            auto_load_skills=False,
+            auto_activate_skills=False,
         )
     )
 
@@ -127,10 +124,13 @@ async def main() -> None:
         await agent.connect(str(server_script))
         live_tools = await agent.refresh_tools()
         print(f'[demo] live MCP tools: {len(live_tools)}', flush=True)
-        print(f'[demo] loaded skills: {len(agent.list_skills())}', flush=True)
-        print('[demo] skill catalog:', json.dumps(agent.list_skills(), ensure_ascii=False, indent=2), flush=True)
 
-        await run_case(agent, args.query)
+        if args.load_skill:
+            await agent.load_skills(args.load_skill)
+        print(f'[demo] loaded skills: {len(agent.list_skills())}', flush=True)
+        print('[demo] loaded skill catalog:', json.dumps(agent.list_skills(), ensure_ascii=False, indent=2), flush=True)
+
+        await run_case(agent, args.query, skill_name=args.use_skill)
 
         if not args.skip_extra_cases:
             for query in DEFAULT_CASES:
