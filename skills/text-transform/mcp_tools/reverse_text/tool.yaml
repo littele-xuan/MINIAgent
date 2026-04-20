@@ -1,0 +1,13 @@
+name: reverse_text
+description: Reverse a piece of text exactly.
+handler: handler.py:handler
+properties:
+  text:
+    type: string
+    description: Input text.
+required: [text]
+examples:
+  - reverse the string abc123
+tags: [text]
+metadata:
+  keywords: [reverse, 倒序, 反转]

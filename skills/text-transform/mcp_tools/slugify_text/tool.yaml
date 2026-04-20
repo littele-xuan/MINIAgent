@@ -1,0 +1,13 @@
+name: slugify_text
+description: Convert free-form text into a lowercase URL slug.
+handler: handler.py:handler
+properties:
+  text:
+    type: string
+    description: Input text to convert.
+required: [text]
+examples:
+  - slugify the title Hello World 2026
+tags: [text, normalize]
+metadata:
+  keywords: [slug, slugify, url]
