@@ -10,6 +10,9 @@ XML_PATTERN = re.compile(r'<[^>]+>')
 ALLOWED_FIELDS = {
     'name',
     'description',
+    'license',
+    'compatibility',
+    'metadata',
     'when_to_use',
     'argument-hint',
     'disable-model-invocation',
@@ -37,7 +40,7 @@ class SkillValidationError(ValueError):
 def validate_frontmatter_keys(raw: dict[str, Any]) -> None:
     unknown = sorted(set(raw.keys()) - ALLOWED_FIELDS)
     if unknown:
-        raise SkillValidationError('Unsupported frontmatter fields for Anthropic-compatible SKILL.md: ' + ', '.join(unknown))
+        raise SkillValidationError('Unsupported SKILL.md frontmatter fields: ' + ', '.join(unknown))
 
 
 def validate_name(name: str, folder_name: str) -> None:
@@ -45,8 +48,8 @@ def validate_name(name: str, folder_name: str) -> None:
         raise SkillValidationError('name must be 1-64 characters')
     if not NAME_PATTERN.match(name):
         raise SkillValidationError('name must contain only lowercase letters, numbers, and hyphens')
-    if 'claude' in name or 'anthropic' in name:
-        raise SkillValidationError('name cannot contain reserved words: claude, anthropic')
+    if '--' in name or name.startswith('-') or name.endswith('-'):
+        raise SkillValidationError('name must not start/end with a hyphen or contain consecutive hyphens')
     if XML_PATTERN.search(name):
         raise SkillValidationError('name cannot contain XML tags')
     if folder_name and name != folder_name:

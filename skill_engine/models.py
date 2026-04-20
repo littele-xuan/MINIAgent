@@ -28,6 +28,9 @@ class SkillFrontmatter:
     mcp: dict[str, Any] = field(default_factory=dict)
     a2a: dict[str, Any] = field(default_factory=dict)
     examples: list[str] = field(default_factory=list)
+    license: str | None = None
+    compatibility: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -109,6 +112,9 @@ class SkillBundle:
             'examples': list(self.frontmatter.examples),
             'mcp': dict(self.frontmatter.mcp or {}),
             'a2a': dict(self.frontmatter.a2a or {}),
+            'license': self.frontmatter.license,
+            'compatibility': self.frontmatter.compatibility,
+            'metadata': dict(self.frontmatter.metadata or {}),
         }
 
     def clone_for_arguments(self, arguments: str) -> 'SkillBundle':

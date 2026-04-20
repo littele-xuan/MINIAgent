@@ -6,6 +6,7 @@ import yaml
 
 from .frontmatter import split_frontmatter
 from .models import SkillBundle, SkillCatalogEntry, SkillFrontmatter, SkillLocalToolSpec
+from .skills_ref import SkillsRefUnavailableError, SkillsRefValidator
 from .validator import (
     SkillValidationError,
     normalize_allowed_tools,
@@ -22,9 +23,18 @@ from .validator import (
 )
 
 
-class AnthropicSkillLoader:
-    def __init__(self, skills_root: str | Path | None):
+class AgentSkillsLoader:
+    """Loads Agent Skills using the open SKILL.md format.
+
+    Preferred validation path: official `skills-ref validate`.
+    Compatibility fallback: local validator for environments where the
+    reference CLI is not installed.
+    """
+
+    def __init__(self, skills_root: str | Path | None, *, prefer_reference_validator: bool = True):
         self.skills_root = Path(skills_root).resolve() if skills_root else None
+        self.prefer_reference_validator = prefer_reference_validator
+        self.skills_ref = SkillsRefValidator()
 
     def discover_bundles(self) -> list[SkillBundle]:
         if self.skills_root is None or not self.skills_root.exists():
@@ -50,6 +60,7 @@ class AnthropicSkillLoader:
 
     def load_bundle(self, skill_dir: str | Path) -> SkillBundle:
         skill_dir = Path(skill_dir).resolve()
+        self._validate_with_reference_impl(skill_dir)
         skill_md = skill_dir / 'SKILL.md'
         raw_frontmatter, body = split_frontmatter(skill_md.read_text(encoding='utf-8'))
         data = yaml.safe_load(raw_frontmatter) or {}
@@ -76,6 +87,9 @@ class AnthropicSkillLoader:
         mcp = normalize_mapping(data.get('mcp'), 'mcp')
         a2a = normalize_mapping(data.get('a2a'), 'a2a')
         examples = normalize_string_list(data.get('examples'), 'examples')
+        license_name = str(data.get('license')).strip() if data.get('license') is not None else None
+        compatibility = str(data.get('compatibility')).strip() if data.get('compatibility') is not None else None
+        metadata = normalize_mapping(data.get('metadata'), 'metadata')
 
         validate_name(name, skill_dir.name)
         validate_description(description)
@@ -103,6 +117,9 @@ class AnthropicSkillLoader:
             mcp=mcp,
             a2a=a2a,
             examples=examples,
+            license=license_name,
+            compatibility=compatibility,
+            metadata=metadata,
         )
 
         resources = [path for path in skill_dir.rglob('*') if path.is_file() and path.name != 'SKILL.md' and 'mcp_tools' not in path.parts]
@@ -129,6 +146,16 @@ class AnthropicSkillLoader:
             if missing:
                 warnings.append(f"Skill '{manifest.name}' references missing tools: {', '.join(missing)}")
         return warnings
+
+    def _validate_with_reference_impl(self, skill_dir: Path) -> None:
+        if not self.prefer_reference_validator:
+            return
+        try:
+            self.skills_ref.validate_or_raise(skill_dir)
+        except SkillsRefUnavailableError:
+            return
+        except ValueError as exc:
+            raise SkillValidationError(str(exc)) from exc
 
     def _load_local_tools(self, skill_dir: Path) -> list[SkillLocalToolSpec]:
         root = skill_dir / 'mcp_tools'
@@ -166,3 +193,7 @@ class AnthropicSkillLoader:
                 metadata=data.get('metadata') or {},
             ))
         return tools
+
+
+# Backward-compatible alias for the existing framework API.
+AnthropicSkillLoader = AgentSkillsLoader

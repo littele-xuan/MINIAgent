@@ -95,7 +95,69 @@ async def _execute_send_message(agent: Any, request: SendMessageRequest, store: 
     return SendMessageResponse(task=task)
 
 
-def build_a2a_app(*, agent: Any, card_builder: Any, base_url: str) -> FastAPI:
+def build_a2a_app(*, agent: Any, card_builder: Any, base_url: str):
+    """Prefer the official a2a-sdk server implementation, with a compatibility fallback."""
+    try:
+        return _build_sdk_app(agent=agent, card_builder=card_builder, base_url=base_url)
+    except Exception:
+        return _build_compat_app(agent=agent, card_builder=card_builder, base_url=base_url)
+
+
+def _build_sdk_app(*, agent: Any, card_builder: Any, base_url: str):
+    from a2a.server.agent_execution import AgentExecutor, RequestContext
+    from a2a.server.apps import A2AStarletteApplication
+    from a2a.server.events import EventQueue
+    from a2a.server.request_handlers import DefaultRequestHandler
+    from a2a.server.tasks import InMemoryTaskStore as SdkInMemoryTaskStore
+    from a2a.server.tasks import TaskUpdater
+    from a2a.types import Part as SdkPart
+    from a2a.types import TaskState as SdkTaskState
+    from a2a.types import TextPart as SdkTextPart
+    from a2a.types import UnsupportedOperationError as SdkUnsupportedOperationError
+    from a2a.utils import new_agent_text_message, new_task
+    from a2a.utils.errors import ServerError
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    sdk_card = card_builder.build_sdk_card(base_url=base_url.rstrip('/'), tool_names=[tool.name for tool in getattr(agent, '_tools', [])])
+
+    class MiniAgentExecutor(AgentExecutor):
+        async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+            query = context.get_user_input()
+            task = context.current_task
+            if not task:
+                task = new_task(context.message)  # type: ignore[arg-type]
+                await event_queue.enqueue_event(task)
+            updater = TaskUpdater(event_queue, task.id, task.context_id)
+            run_result = await agent.run_detailed(
+                query,
+                accepted_output_modes=list(context.message.metadata.get('accepted_output_modes', [])) if getattr(context, 'message', None) and getattr(context.message, 'metadata', None) else None,
+            )
+            if run_result.output_mode == 'application/json':
+                await updater.add_artifact([SdkPart(root=SdkTextPart(text=run_result.answer or ''))], name='response')
+            else:
+                await updater.add_artifact([SdkPart(root=SdkTextPart(text=run_result.answer))], name='response')
+            await updater.complete()
+
+        async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
+            raise ServerError(error=SdkUnsupportedOperationError())
+
+    request_handler = DefaultRequestHandler(
+        agent_executor=MiniAgentExecutor(),
+        task_store=SdkInMemoryTaskStore(),
+    )
+    a2a_app = A2AStarletteApplication(agent_card=sdk_card, http_handler=request_handler)
+
+    async def health(_request):
+        return StarletteJSONResponse({'ok': True, 'agent': agent.config.name})
+
+    routes = list(a2a_app.routes())
+    routes.append(Route('/health', methods=['GET'], endpoint=health))
+    return Starlette(routes=routes)
+
+
+def _build_compat_app(*, agent: Any, card_builder: Any, base_url: str) -> FastAPI:
     app = FastAPI(title=f'{agent.config.name} A2A Agent', version=A2A_PROTOCOL_VERSION)
     store = InMemoryTaskStore()
     agent_card = card_builder.build(base_url=base_url.rstrip('/'), tool_names=[tool.name for tool in getattr(agent, '_tools', [])])
@@ -136,6 +198,10 @@ def build_a2a_app(*, agent: Any, card_builder: Any, base_url: str) -> FastAPI:
     @app.get('/.well-known/agent-card.json')
     async def agent_card_endpoint() -> JSONResponse:
         return JSONResponse(content=agent_card.model_dump(by_alias=True, exclude_none=True), headers={'Cache-Control': 'public, max-age=300', 'ETag': etag})
+
+    @app.get('/health')
+    async def health() -> JSONResponse:
+        return JSONResponse({'ok': True, 'agent': agent.config.name})
 
     @app.post('/a2a/v1/message:send')
     async def http_send_message(request: Request, a2a_version: str | None = Header(default=None, alias='A2A-Version'), a2a_version_query: str | None = Query(default=None, alias='A2A-Version')) -> JSONResponse:
@@ -191,7 +257,7 @@ def build_a2a_app(*, agent: Any, card_builder: Any, base_url: str) -> FastAPI:
 
 
 def validate_version(version: str) -> None:
-    if version != A2A_PROTOCOL_VERSION:
+    if version not in {A2A_PROTOCOL_VERSION, '0.3'}:
         raise VersionNotSupportedError(metadata={'requestedVersion': version, 'supportedVersion': A2A_PROTOCOL_VERSION})
 
 

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-from skill_engine import AnthropicSkillLoader
+from skill_engine import AgentSkillsLoader
 
 from .models import A2A_PROTOCOL_VERSION, AgentCapabilities, AgentCard, AgentInterface, AgentProvider, AgentSkill
 
@@ -63,6 +63,33 @@ class AgentCardBuilder:
             iconUrl=self.icon_url,
         )
 
+    def build_sdk_card(self, *, base_url: str, tool_names: Iterable[str]):
+        """Build the official a2a-sdk AgentCard payload when the SDK is installed."""
+        from a2a.types import AgentCapabilities as SdkAgentCapabilities
+        from a2a.types import AgentCard as SdkAgentCard
+        from a2a.types import AgentSkill as SdkAgentSkill
+
+        skills = []
+        for skill in self._load_skills(tool_names):
+            skills.append(SdkAgentSkill(
+                id=skill.id,
+                name=skill.name,
+                description=skill.description,
+                tags=list(skill.tags),
+                examples=list(skill.examples),
+            ))
+
+        return SdkAgentCard(
+            name=self.agent_name,
+            description=self.description,
+            url=base_url.rstrip('/') + '/a2a/v1',
+            version=self.agent_version,
+            default_input_modes=['text'],
+            default_output_modes=['text', 'application/json'],
+            capabilities=SdkAgentCapabilities(streaming=False),
+            skills=skills,
+        )
+
     def compute_etag(self, card: AgentCard) -> str:
         payload = json.dumps(card.model_dump(by_alias=True, exclude_none=True), ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(payload.encode('utf-8')).hexdigest()
@@ -80,7 +107,7 @@ class AgentCardBuilder:
         )]
         if self.skills_root is None or not self.skills_root.exists():
             return fallback
-        loader = AnthropicSkillLoader(self.skills_root)
+        loader = AgentSkillsLoader(self.skills_root)
         bundles = loader.discover_bundles()
         if not bundles:
             return fallback
