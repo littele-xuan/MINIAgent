@@ -49,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--api-base', default=os.getenv('MCP_API_BASE') or 'https://api.openai.com/v1')
     parser.add_argument('--api-key', default=os.getenv('MCP_API_KEY') or os.getenv('OPENAI_API_KEY') or '')
     parser.add_argument('--model', default=os.getenv('MCP_MODEL') or os.getenv('OPENAI_MODEL') or '')
-    parser.add_argument('--planner', choices=['api', 'heuristic'], default='api')
+    parser.add_argument('--planner', choices=['api', 'openai'], default='api')
     parser.add_argument('--max-steps', type=int, default=6)
     parser.add_argument('--connect-timeout', type=float, default=20.0)
     parser.add_argument('--planner-timeout', type=float, default=90.0)
@@ -92,8 +92,8 @@ async def governance_smoke(agent: Agent) -> None:
 
 async def main() -> None:
     args = build_parser().parse_args()
-    if args.planner == 'api' and (not args.api_key or not args.model):
-        raise SystemExit('planner=api requires MCP_API_KEY/OPENAI_API_KEY and MCP_MODEL/OPENAI_MODEL')
+    if not args.api_key or not args.model:
+        raise SystemExit('This script requires MCP_API_KEY/OPENAI_API_KEY and MCP_MODEL/OPENAI_MODEL because planning is fully LLM-driven.')
 
     root = Path(__file__).resolve().parent
     server_script = root / 'mcp_lib' / 'server' / 'mcp_server.py'

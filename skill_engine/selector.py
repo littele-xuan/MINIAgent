@@ -1,50 +1,86 @@
 from __future__ import annotations
 
-import re
-from typing import Iterable
+import json
+from typing import Iterable, Sequence
 
-from .models import SkillActivation, SkillBundle
+from pydantic import BaseModel, ConfigDict
+
+from llm_runtime import OpenAICompatibleLLM
+
+from .models import SkillBundle
 
 
-STOPWORDS = {
-    'the', 'a', 'an', 'and', 'or', 'to', 'for', 'of', 'in', 'on', 'with', 'use', 'this', 'when',
-    '我', '你', '他', '她', '它', '的', '了', '和', '或', '与', '在', '对', '把', '将', '一个',
-    '需要', '使用', '用于', '用户', '请求', '进行', '处理', '分析', '查看', '读取', '工具', '技能',
-}
+class SkillSelectionDecision(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    skill_name: str | None = None
+    skill_arguments: str = ''
+    reason: str = ''
 
 
 class SkillSelector:
-    def choose(self, query: str, bundles: Iterable[SkillBundle]) -> SkillBundle | None:
-        terms = self._terms(query)
-        best: tuple[float, SkillBundle] | None = None
-        for bundle in bundles:
-            text = ' '.join(filter(None, [bundle.name, bundle.description, bundle.when_to_use or '', ' '.join(bundle.allowed_tools), ' '.join(bundle.frontmatter.examples or [])]))
-            lower_text = text.lower()
-            score_terms = self._terms(text)
-            overlap = terms & score_terms
-            score = float(len(overlap))
-            for term in terms:
-                if term in lower_text:
-                    score += 0.5
-            if bundle.name in query.lower():
-                score += 3.0
-            if score <= 0:
-                continue
-            if best is None or score > best[0]:
-                best = (score, bundle)
-        return best[1] if best is not None else None
+    """LLM-based skill selector.
 
-    def _terms(self, text: str) -> set[str]:
-        raw_tokens = re.findall(r'[a-zA-Z0-9_-]+|[一-鿿]{2,}', text.lower())
-        output: set[str] = set()
-        for token in raw_tokens:
-            if token in STOPWORDS or len(token) < 2:
-                continue
-            output.add(token)
-            if re.fullmatch(r'[一-鿿]+', token):
-                for size in (2, 3, 4):
-                    for idx in range(max(0, len(token) - size + 1)):
-                        gram = token[idx: idx + size]
-                        if gram not in STOPWORDS:
-                            output.add(gram)
-        return output
+    No keyword scoring is used. The model receives the live skill catalog and
+    decides whether a skill should be activated for the current request.
+    """
+
+    def __init__(self, llm: OpenAICompatibleLLM) -> None:
+        self.llm = llm
+
+    async def choose(self, query: str, bundles: Iterable[SkillBundle]) -> SkillBundle | None:
+        items = list(bundles)
+        if not items:
+            return None
+        decision = await self.decide(query, items)
+        if not decision.skill_name:
+            return None
+        for bundle in items:
+            if bundle.name == decision.skill_name:
+                return bundle.clone_for_arguments(decision.skill_arguments)
+        return None
+
+    async def decide(self, query: str, bundles: Sequence[SkillBundle]) -> SkillSelectionDecision:
+        catalog = [
+            {
+                'name': bundle.name,
+                'description': bundle.description,
+                'when_to_use': bundle.when_to_use,
+                'allowed_tools': list(bundle.allowed_tools),
+                'output_modes': list(bundle.output_modes),
+                'accepted_output_modes': list(bundle.accepted_output_modes),
+                'examples': list(bundle.frontmatter.examples or []),
+                'a2a': dict(bundle.frontmatter.a2a or {}),
+                'mcp': dict(bundle.frontmatter.mcp or {}),
+            }
+            for bundle in bundles
+        ]
+        messages = [
+            {
+                'role': 'system',
+                'content': (
+                    'You are the skill selection module for an MCP/A2A agent. '
+                    'Choose a skill only when it materially improves the handling of the request. '
+                    'Do not force a skill when the base agent can answer directly. '
+                    'Do not invent skill names. If no skill is clearly appropriate, return skill_name=null.'
+                ),
+            },
+            {
+                'role': 'user',
+                'content': json.dumps(
+                    {
+                        'query': query,
+                        'skills': catalog,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            },
+        ]
+        return await self.llm.chat_json_model(
+            messages=messages,
+            model_type=SkillSelectionDecision,
+            schema_name='skill_selection_decision',
+            temperature=0.0,
+            max_output_tokens=600,
+        )

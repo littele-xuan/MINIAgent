@@ -8,3 +8,4 @@ mcp[cli]>=1.22.0
 a2a-sdk>=0.3.0
 PyYAML>=6.0
 jsonschema>=4.23
+langfuse  # optional: OpenAI call tracing/monitoring

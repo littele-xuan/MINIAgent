@@ -3,18 +3,21 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .context import BaseContextManager, LayeredContextManager
-from .planners import BasePlanner, FinalAnswer, HeuristicPlanner, OpenAIPlanner, PlannerOutput
-from .tool_runtime import BaseToolRuntime, MCPClientToolRuntime, ToolDescriptor
 from a2a_runtime import A2AClient, AgentCardBuilder, PeerAgent, SendMessageConfiguration, SendMessageRequest, build_a2a_app
+from context_runtime.context import BaseContextManager, LayeredContextManager
+from context_runtime.memory import ContextMemoryEngine, MemoryEngineConfig
+from llm_runtime import BaseLLM, LLMClientConfig, OpenAICompatibleLLM, require_llm_config
+from prompt_runtime import render_prompt
 from skill_engine import AnthropicSkillLoader, SkillBundle, SkillSelector, SkillToolRegistrar
+
+from .planners import BasePlanner, FinalAnswer, OpenAIPlanner, PlannerOutput
+from .tool_runtime import BaseToolRuntime, MCPClientToolRuntime, ToolDescriptor
 
 
 _REGISTRY_MUTATION_TOOLS = {
@@ -49,6 +52,14 @@ class AgentRunResult(BaseModel):
     trace: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class PeerRoutingDecision(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    should_delegate: bool = False
+    peer_name: str | None = None
+    reason: str = ''
+
+
 @dataclass(slots=True)
 class AgentConfig:
     name: str = 'agent'
@@ -58,18 +69,28 @@ class AgentConfig:
     skills_root: str | None = None
     skill_tool_policy: str = 'advisory'  # advisory | restrictive
     auto_load_skills: bool = False
-    auto_activate_skills: bool = False
-    planner: str = 'api'  # api | openai | heuristic
-    api_base: str = field(default_factory=lambda: os.getenv('MCP_API_BASE')  or 'https://api.openai.com/v1')
-    api_key: str = field(default_factory=lambda: os.getenv('MCP_API_KEY') or '')
-    model: str = field(default_factory=lambda: os.getenv('MCP_MODEL')  or '')
-    temperature: float = 0.1
+    auto_activate_skills: bool = True
+    planner: str = 'api'  # api | openai
+    api_base: str = field(default_factory=lambda: os.getenv('MCP_API_BASE') or os.getenv('OPENAI_BASE_URL') or 'https://api.openai.com/v1')
+    api_key: str = field(default_factory=lambda: os.getenv('MCP_API_KEY') or os.getenv('OPENAI_API_KEY') or '')
+    model: str = field(default_factory=lambda: os.getenv('MCP_MODEL') or os.getenv('OPENAI_MODEL') or '')
+    temperature: float = 0.0
     max_steps: int = 6
     connect_timeout_seconds: float = 20.0
     planner_timeout_seconds: float = 90.0
     tool_timeout_seconds: float = 90.0
     observation_preview_chars: int = 600
-    a2a_routing_threshold: float = 3.0
+    memory_enabled: bool = True
+    memory_root: str | None = None
+    memory_namespace: str = 'default'
+    memory_session_id: str | None = None
+    memory_soft_token_limit: int = 2200
+    memory_hard_token_limit: int = 3200
+    memory_keep_recent_messages: int = 6
+    memory_summary_target_tokens: int = 650
+    memory_large_observation_tokens: int = 500
+    memory_retrieve_limit: int = 8
+    memory_auto_git_commit: bool = False
 
 
 class Agent:
@@ -84,6 +105,7 @@ class Agent:
         subagent_manager: Any | None = None,
         memory_manager: Any | None = None,
         a2a_client: A2AClient | None = None,
+        llm: BaseLLM | None = None,
     ) -> None:
         self.config = config
         self.tool_runtime = tool_runtime
@@ -91,33 +113,86 @@ class Agent:
         self.scheduler = scheduler
         self.subagent_manager = subagent_manager
         self.memory_manager = memory_manager
-        self.skill_loader = AnthropicSkillLoader(config.skills_root) if config.skills_root else None
-        self.skill_selector = SkillSelector()
-        self.skill_registrar = SkillToolRegistrar()
-        self.skill_catalog: list[SkillBundle] = []
-        self.active_skill: SkillBundle | None = None
-        self.delegation_skill: SkillBundle | None = None
         self._tools: list[ToolDescriptor] = []
         self.a2a_enabled = False
         self.a2a_client = a2a_client or A2AClient()
         self.peers: dict[str, PeerAgent] = {}
         self.card_builder: AgentCardBuilder | None = None
+        self._owns_llm = False
+
+        self.llm = llm
+        if self.llm is None and self._llm_required(planner=planner, memory_manager=memory_manager):
+            client_cfg = require_llm_config(api_base=config.api_base, api_key=config.api_key, model=config.model)
+            self.llm = OpenAICompatibleLLM(
+                LLMClientConfig(
+                    api_base=client_cfg.api_base,
+                    api_key=client_cfg.api_key,
+                    model=client_cfg.model,
+                    temperature=config.temperature,
+                    connect_timeout_seconds=config.connect_timeout_seconds,
+                    request_timeout_seconds=config.planner_timeout_seconds,
+                    max_retries=client_cfg.max_retries,
+                    max_output_tokens=client_cfg.max_output_tokens,
+                    enable_langfuse=client_cfg.enable_langfuse,
+                    langfuse_public_key=client_cfg.langfuse_public_key,
+                    langfuse_secret_key=client_cfg.langfuse_secret_key,
+                    langfuse_base_url=client_cfg.langfuse_base_url,
+                    langfuse_session_id=client_cfg.langfuse_session_id,
+                    langfuse_user_id=client_cfg.langfuse_user_id,
+                    langfuse_tags=client_cfg.langfuse_tags,
+                    use_responses_api=client_cfg.use_responses_api,
+                )
+            )
+            self._owns_llm = True
+
+        if self.memory_manager is None and config.memory_enabled:
+            if self.llm is None:
+                raise ValueError('Memory is enabled but no shared LLM client is available.')
+            memory_root = config.memory_root or str((Path.cwd() / '.agent_memory' / config.name).resolve())
+            self.memory_manager = ContextMemoryEngine(
+                MemoryEngineConfig(
+                    root_dir=memory_root,
+                    namespace=config.memory_namespace or config.name,
+                    session_id=config.memory_session_id,
+                    soft_token_limit=config.memory_soft_token_limit,
+                    hard_token_limit=config.memory_hard_token_limit,
+                    keep_recent_messages=config.memory_keep_recent_messages,
+                    summary_target_tokens=config.memory_summary_target_tokens,
+                    large_observation_tokens=config.memory_large_observation_tokens,
+                    retrieve_limit=config.memory_retrieve_limit,
+                    auto_git_commit=config.memory_auto_git_commit,
+                    api_base=config.api_base,
+                    api_key=config.api_key,
+                    model=config.model,
+                    temperature=config.temperature,
+                    connect_timeout_seconds=config.connect_timeout_seconds,
+                    request_timeout_seconds=config.planner_timeout_seconds,
+                ),
+                llm=self.llm,
+            )
+
+        self.skill_loader = AnthropicSkillLoader(config.skills_root) if config.skills_root else None
+        self.skill_selector = SkillSelector(self.llm) if (self.llm is not None and config.auto_activate_skills) else None
+        self.skill_registrar = SkillToolRegistrar()
+        self.skill_catalog: list[SkillBundle] = []
+        self.active_skill: SkillBundle | None = None
+        self.delegation_skill: SkillBundle | None = None
 
         if planner is not None:
             self.planner = planner
-        elif config.planner in {'api', 'openai'}:
-            if not (config.api_base and config.api_key and config.model):
-                raise ValueError('API planner requires api_base/api_key/model. Provide env vars or pass a custom planner.')
-            self.planner = OpenAIPlanner(
-                api_base=config.api_base,
-                api_key=config.api_key,
-                model=config.model,
-                temperature=config.temperature,
-                connect_timeout_seconds=config.connect_timeout_seconds,
-                request_timeout_seconds=config.planner_timeout_seconds,
-            )
         else:
-            self.planner = HeuristicPlanner()
+            if self.llm is None:
+                raise ValueError('A real LLM client is required unless a custom planner is provided and memory is disabled.')
+            self.planner = OpenAIPlanner(llm=self.llm)
+
+    def _llm_required(self, *, planner: BasePlanner | None, memory_manager: Any | None) -> bool:
+        if planner is None:
+            return True
+        if self.config.memory_enabled and memory_manager is None:
+            return True
+        if self.config.auto_activate_skills and self.config.skills_root:
+            return True
+        return False
 
     async def attach_tool_runtime(self, tool_runtime: BaseToolRuntime) -> None:
         self.tool_runtime = tool_runtime
@@ -145,6 +220,10 @@ class Agent:
         if self.tool_runtime is not None:
             self._log('closing MCP runtime')
             await self.tool_runtime.close()
+        if self.memory_manager is not None and hasattr(self.memory_manager, 'close'):
+            await self.memory_manager.close()
+        elif self._owns_llm and self.llm is not None:
+            await self.llm.close()
         await self.a2a_client.close()
 
     async def refresh_tools(self) -> list[ToolDescriptor]:
@@ -194,9 +273,7 @@ class Agent:
     def activate_skill(self, query: str, *, skill_name: str | None = None, skill_arguments: str = '') -> SkillBundle | None:
         self.active_skill = None
         self.delegation_skill = None
-        if not self.skill_catalog:
-            return None
-        if not skill_name:
+        if not self.skill_catalog or not skill_name:
             return None
 
         selected = None
@@ -213,6 +290,22 @@ class Agent:
         else:
             self.active_skill = selected
             self._log(f'active prompt skill selected explicitly: {selected.name}')
+        return selected
+
+    async def _auto_select_skill(self, query: str) -> SkillBundle | None:
+        self.active_skill = None
+        self.delegation_skill = None
+        if not self.skill_catalog or self.skill_selector is None:
+            return None
+        selected = await self.skill_selector.choose(query, self.skill_catalog)
+        if selected is None:
+            return None
+        if self._is_a2a_skill(selected):
+            self.delegation_skill = selected
+            self._log(f'runtime A2A skill auto-selected: {selected.name}')
+        else:
+            self.active_skill = selected
+            self._log(f'active prompt skill auto-selected: {selected.name}')
         return selected
 
     async def list_visible_tools(self) -> list[ToolDescriptor]:
@@ -300,6 +393,8 @@ class Agent:
         accepted_output_modes: list[str] | None = None,
     ) -> AgentRunResult:
         selected_skill = self.activate_skill(query, skill_name=skill_name, skill_arguments=skill_arguments)
+        if selected_skill is None and skill_name is None and self.config.auto_activate_skills:
+            selected_skill = await self._auto_select_skill(query)
         self._log(f'run start | query={query}')
 
         delegated = await self._maybe_run_a2a(
@@ -314,8 +409,16 @@ class Agent:
         observations: list[dict[str, Any]] = []
         max_steps = max_steps or self.config.max_steps
 
-        for step in range(1, max_steps + 1):
+        if self.memory_manager is not None and hasattr(self.memory_manager, 'begin_turn'):
+            await self.memory_manager.begin_turn(query)
+
+        step = 0
+        while step < max_steps:
+            step += 1
+            if self.memory_manager is not None and hasattr(self.memory_manager, 'ensure_hard_limit'):
+                await self.memory_manager.ensure_hard_limit()
             visible_tools = await self.list_visible_tools()
+            memory_packet = await self.memory_manager.build_context_packet(query=query) if self.memory_manager is not None and hasattr(self.memory_manager, 'build_context_packet') else None
             prompt_context = self.context_manager.build_prompt_context(
                 agent=self,
                 query=query,
@@ -323,6 +426,7 @@ class Agent:
                 visible_tools=visible_tools,
                 observations=observations,
                 accepted_output_modes=accepted_output_modes,
+                memory_packet=memory_packet,
             )
             self._log(f'step {step}/{max_steps} | visible_tools={len(visible_tools)} | accepted_output_modes={prompt_context.metadata.get("accepted_output_modes")}')
             plan = await asyncio.wait_for(
@@ -337,26 +441,32 @@ class Agent:
             done, final_payload, event = await self._execute_plan(plan)
             self._log(f'step {step} observation | {self._preview(event.get("observation", ""))}')
             observations.append({'thought': plan.thought, **event})
+            if self.memory_manager is not None and hasattr(self.memory_manager, 'record_observation') and event.get('mode') == 'mcp':
+                await self.memory_manager.record_observation(event)
 
             if done:
                 coerced = self._coerce_output(final_payload or {'output_mode': 'text/plain', 'answer': ''}, accepted_output_modes)
+                if self.memory_manager is not None and hasattr(self.memory_manager, 'finalize_turn'):
+                    await self.memory_manager.finalize_turn(answer=coerced['answer'], output_mode=coerced['output_mode'], payload=coerced.get('payload'))
                 self._log(f'run complete | output_mode={coerced["output_mode"]} | answer={self._preview(coerced["answer"])}')
                 return AgentRunResult(
                     answer=coerced['answer'],
                     output_mode=coerced['output_mode'],
                     payload=coerced.get('payload'),
-                    selected_skill=self.active_skill.name if self.active_skill else None,
+                    selected_skill=(self.delegation_skill or self.active_skill).name if (self.delegation_skill or self.active_skill) else None,
                     trace=observations,
                 )
 
         fallback = {'output_mode': 'text/plain', 'answer': '已达到最大执行步数。', 'payload': None}
         coerced = self._coerce_output(fallback, accepted_output_modes)
+        if self.memory_manager is not None and hasattr(self.memory_manager, 'finalize_turn'):
+            await self.memory_manager.finalize_turn(answer=coerced['answer'], output_mode=coerced['output_mode'], payload=coerced.get('payload'))
         self._log('run stopped at max_steps')
         return AgentRunResult(
             answer=coerced['answer'],
             output_mode=coerced['output_mode'],
             payload=coerced.get('payload'),
-            selected_skill=self.active_skill.name if self.active_skill else None,
+            selected_skill=(self.delegation_skill or self.active_skill).name if (self.delegation_skill or self.active_skill) else None,
             trace=observations,
         )
 
@@ -410,7 +520,7 @@ class Agent:
         if explicit_skill_name and self.delegation_skill is None:
             return None
 
-        peer, reason = self._select_peer_for_query(query, force=self.delegation_skill is not None)
+        peer, reason = await self._select_peer_for_query(query, force=self.delegation_skill is not None)
         if peer is None:
             if self.delegation_skill is not None:
                 raise RuntimeError('A2A routing skill was selected, but no peer matched the current request.')
@@ -441,57 +551,40 @@ class Agent:
             trace=trace,
         )
 
-    def _select_peer_for_query(self, query: str, *, force: bool) -> tuple[PeerAgent | None, str]:
-        lower = query.lower()
-        terms = self._routing_terms(query)
-        best_peer = None
-        best_score = 0.0
-        best_reason = ''
-        math_like = self._looks_like_math(query)
-        registry_like = any(token in lower for token in ['registry', 'tool', 'tools', 'skill', 'skills', 'mcp', '工具', '技能'])
-
-        for peer in self.peers.values():
-            score = 0.0
-            reasons: list[str] = []
-            name_lower = peer.name.lower()
-            desc_lower = peer.description.lower()
-            tags_lower = [tag.lower() for tag in peer.tags]
-
-            if name_lower in lower:
-                score += 6.0
-                reasons.append('peer name matched the request')
-            for tag in tags_lower:
-                if tag and tag in lower:
-                    score += 3.0
-                    reasons.append(f'tag matched: {tag}')
-            for term in terms:
-                if term in desc_lower:
-                    score += 0.5
-            if math_like and {'math', 'calculator'} & set(tags_lower):
-                score += 4.0
-                reasons.append('math-shaped request matched peer tags')
-            if registry_like and {'registry', 'tools', 'skills', 'mcp'} & set(tags_lower):
-                score += 4.0
-                reasons.append('registry-shaped request matched peer tags')
-
-            if score > best_score:
-                best_score = score
-                best_peer = peer
-                best_reason = '; '.join(dict.fromkeys(reasons)) or 'best peer score'
-
-        if best_peer is None:
+    async def _select_peer_for_query(self, query: str, *, force: bool) -> tuple[PeerAgent | None, str]:
+        if not self.peers or self.llm is None:
             return None, ''
-        if not force and best_score < self.config.a2a_routing_threshold:
-            return None, ''
-        return best_peer, best_reason or 'forced by runtime A2A skill'
-
-    def _routing_terms(self, text: str) -> set[str]:
-        return set(re.findall(r'[a-zA-Z0-9_-]+|[一-鿿]{2,}', text.lower()))
-
-    def _looks_like_math(self, text: str) -> bool:
-        return bool(re.search(r'[0-9][0-9\s\+\-\*/\(\)\.%]{1,}', text)) or any(
-            token in text.lower() for token in ['compute', 'calculate', 'math', '算一下', '计算']
+        peer_catalog = [
+            {
+                'name': peer.name,
+                'description': peer.description,
+                'tags': list(peer.tags),
+                'agent_card_url': peer.agent_card_url,
+            }
+            for peer in self.peers.values()
+        ]
+        decision = await self.llm.chat_json_model(
+            messages=[
+                {
+                    'role': 'system',
+                    'content': render_prompt('agent/a2a_router_system'),
+                },
+                {
+                    'role': 'user',
+                    'content': json.dumps({'query': query, 'force': force, 'peers': peer_catalog}, ensure_ascii=False, indent=2),
+                },
+            ],
+            model_type=PeerRoutingDecision,
+            schema_name='peer_routing_decision',
+            temperature=0.0,
+            max_output_tokens=500,
         )
+        if not decision.should_delegate or not decision.peer_name:
+            return None, ''
+        peer = self.peers.get(decision.peer_name)
+        if peer is None:
+            return None, ''
+        return peer, decision.reason or ('forced by runtime A2A skill' if force else 'selected by model')
 
     def _is_a2a_skill(self, bundle: SkillBundle) -> bool:
         return bool((bundle.frontmatter.a2a or {}).get('enabled'))
@@ -575,12 +668,10 @@ class Agent:
 
     def _preview(self, value: Any) -> str:
         text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
-        if len(text) <= self.config.observation_preview_chars:
-            return text
-        return text[: self.config.observation_preview_chars] + '...'
+        return text[: self.config.observation_preview_chars]
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> 'Agent':
         return self
 
-    async def __aexit__(self, exc_type, exc, tb):
+    async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.disconnect()
