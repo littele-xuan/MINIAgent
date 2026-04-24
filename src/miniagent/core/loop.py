@@ -27,7 +27,7 @@ class AgentLoop:
     log_dir: str = "workspace/logs"
     max_turns: int = 40
     event_callback: EventCallback | None = None
-    max_empty_response_retries: int = 2
+    max_empty_response_retries: int = 5
 
     def run(self, state: AgentState) -> AgentResult:
         memory_recall = self.memory.recall(state.user_input).format_for_prompt()
@@ -74,10 +74,20 @@ class AgentLoop:
                     break
                 empty_retries += 1
                 if empty_retries <= self.max_empty_response_retries and state.turn < self.max_turns:
-                    msg = (
-                        "Your previous assistant response was empty. Provide a non-empty concise final answer now. "
-                        "If the task requires project state, call tools; otherwise answer directly."
+                    task_hint = (state.user_input[:400] + "...") if len(state.user_input) > 400 else state.user_input
+                    checkpoint = self.context.working_checkpoint
+                    parts = [
+                        "Your previous response was empty — you must NOT return an empty response.",
+                        f"Current task: {task_hint}",
+                    ]
+                    if checkpoint:
+                        parts.append(f"Working checkpoint (resume from here): {checkpoint}")
+                    parts.append(
+                        "Either call the next required tool to continue making progress, "
+                        "or write your final answer if all steps are already complete. "
+                        "Never return empty."
                     )
+                    msg = "\n".join(parts)
                     state.input_items.append({"role": "user", "content": msg})
                     self._emit({"event": "llm_empty_retry", "turn": state.turn, "attempt": empty_retries})
                     logger.write("llm_empty_retry", {"turn": state.turn, "attempt": empty_retries})
