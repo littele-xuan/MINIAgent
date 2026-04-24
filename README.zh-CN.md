@@ -285,6 +285,6 @@ MINIAgent 是一种在多个 Agent 框架中都能找到的模式的专注实现
 | 项目 | 关注点 |
 |---|---|
 | **[LangGraph](https://github.com/langchain-ai/langgraph)** | `v1/` 实验所使用的基于图的 Agent 运行时。`StateGraph`、`ToolNode`、`langgraph.store` 和 `MemorySaver` 是 MINIAgent 循环、工具注册表和记忆存储的 LangGraph 对应物。 |
-| **[GenericAgent](https://github.com/langchain-ai/langgraph/tree/main/libs/langgraph)** | MINIAgent 命名参考的底层设计模式：带可插拔工具和记忆的通用 观察–规划–行动 循环。 |
+| **[GenericAgent](https://github.com/lsdefine/GenericAgent)** | MINIAgent 命名参考的底层设计模式：带可插拔工具和记忆的通用 观察–规划–行动 循环。 |
 | **[smolagents](https://github.com/huggingface/smolagents)** | HuggingFace 的最小 Agent 库，与 MINIAgent 理念相近：保持循环小、工具接口简单、模型无关。使用 `CodeAgent` / `ToolCallingAgent` 分离。 |
-| **[Hermes](https://github.com/NousResearch/Hermes-Function-Calling)** | NousResearch 的 function-calling 微调和提示规范，用于理解工具调用提示和 JSON Schema 函数定义在开源权重模型中的演进。 |
+| **[Hermes](https://github.com/nousresearch/hermes-agent)** | NousResearch 的 function-calling 微调和提示规范，用于理解工具调用提示和 JSON Schema 函数定义在开源权重模型中的演进。 |
