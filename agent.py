@@ -1,5 +1,4 @@
-from agent_core import Agent, AgentConfig
+from langgraph_agent.agent.runtime import LangGraphAgent, GraphRunResult
+from langgraph_agent.config.models import LangGraphAgentConfig
 
-MCPAgent = Agent
-
-__all__ = ['Agent', 'AgentConfig', 'MCPAgent']
+__all__ = ['LangGraphAgent', 'LangGraphAgentConfig', 'GraphRunResult']

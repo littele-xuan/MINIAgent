@@ -131,3 +131,15 @@ python agent_test.py --llm
 ## License
 
 本项目使用 [MIT License](./LICENSE)。
+
+---
+
+## LangGraph 科研级 Agent 基线入口
+
+本版本新增 `langgraph_agent/` 作为主实现，真实 API 场景测试入口为：
+
+```bash
+python real_scenarios/run_research_agent_scenarios.py --reset --scenario all
+```
+
+详细说明见 `LANGGRAPH_AGENT_RESEARCH_BASELINE_PATCH.zh-CN.md`。
