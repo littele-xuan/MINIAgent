@@ -1,9 +1,13 @@
+# Core MINIAgent v2 runtime
+openai>=1.93.0
+langfuse>=4.0.0
+PyYAML>=6.0.0
+
+# Legacy v1 LangGraph runtime; install only if you use v1/*
 langgraph>=0.6.0
 langchain>=1.0.0
 langchain-openai>=0.3.0
 langchain-mcp-adapters>=0.1.0
 langgraph-checkpoint-sqlite>=2.0.0
 pydantic>=2.7.0
-PyYAML>=6.0.0
-langfuse>=3.8.0
 jsonschema>=4.22.0

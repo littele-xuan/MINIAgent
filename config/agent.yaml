@@ -1,0 +1,43 @@
+name: MINIAgent
+max_turns: 40
+workspace_dir: workspace
+memory_dir: memory
+log_dir: workspace/logs
+system_prompt_path: src/miniagent/prompts/system.md
+
+llm:
+  provider: openai-compatible
+  model: gpt-5.4
+  model_env: MCP_MODEL
+  api_key_env: MCP_API_KEY
+  base_url: null
+  base_url_env: MCP_API_BASE
+  fallback_model_env: OPENAI_MODEL
+  fallback_api_key_env: OPENAI_API_KEY
+  fallback_base_url_env: OPENAI_BASE_URL
+  # MCP/OpenAI-compatible gateways usually support /v1/chat/completions first.
+  # Options: chat_completions | responses | auto
+  api_mode: chat_completions
+  temperature: null
+  max_output_tokens: 4096
+  request_timeout_seconds: 120
+  max_retries: 2
+  store: false
+
+observability:
+  provider: langfuse
+  enabled: true
+  public_key_env: LANGFUSE_PUBLIC_KEY
+  secret_key_env: LANGFUSE_SECRET_KEY
+  base_url_env: LANGFUSE_BASE_URL
+  default_base_url: https://cloud.langfuse.com
+  capture_io: true
+
+context:
+  keep_recent_summaries: 8
+  max_tool_output_chars: 12000
+
+tools:
+  enable_file_tools: true
+  enable_shell_tools: true
+  enable_memory_tools: true
